@@ -110,10 +110,28 @@ const RENAMED_MIGRATION_COMPATIBILITY = [
     toName: "provider_connection_max_concurrent",
   },
   {
+    fromVersion: "028",
+    fromName: "compression_settings",
+    toVersion: "034",
+    toName: "compression_settings",
+  },
+  {
     fromVersion: "032",
     fromName: "create_reasoning_cache",
     toVersion: "033",
     toName: "create_reasoning_cache",
+  },
+  {
+    fromVersion: "032",
+    fromName: "compression_analytics",
+    toVersion: "038",
+    toName: "compression_analytics",
+  },
+  {
+    fromVersion: "033",
+    fromName: "compression_cache_stats",
+    toVersion: "039",
+    toName: "compression_cache_stats",
   },
 ] as const;
 
@@ -285,6 +303,8 @@ function isSchemaAlreadyApplied(
       );
     case "045":
       return hasColumn(db, "call_logs", "tokens_compressed");
+    case "051":
+      return !hasColumn(db, "files", "status");
     default:
       return false;
   }
@@ -802,7 +822,7 @@ export function runMigrations(db: Database.Database, options?: { isNewDb?: boole
 
   // After applying all migrations, insert default settings if we just ran migration 46
   try {
-    if (appliedRecords.some((m) => m.name.startsWith("046_"))) {
+    if (appliedRecords.some((m) => m.name.startsWith("051_"))) {
       insertDefaultDatabaseSettings(db);
     }
   } catch (error) {

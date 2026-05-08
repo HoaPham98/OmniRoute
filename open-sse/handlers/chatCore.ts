@@ -30,6 +30,7 @@ import {
 import {
   COOLDOWN_MS,
   HTTP_STATUS,
+  MAX_TOOLS_LIMIT,
   PROVIDER_MAX_TOKENS,
   STREAM_IDLE_TIMEOUT_MS,
 } from "../config/constants.ts";
@@ -43,6 +44,7 @@ import { isDetailedLoggingEnabled } from "@/lib/db/detailedLogs";
 import { getCallLogPipelineCaptureStreamChunks } from "@/lib/logEnv";
 import { logAuditEvent } from "@/lib/compliance";
 import { extractProviderWarnings } from "@/lib/compliance/providerAudit";
+import { adaptBodyForCompression } from "../services/compression/bodyAdapter.ts";
 import { handleBypassRequest } from "../utils/bypassHandler.ts";
 import {
   saveRequestUsage,
@@ -51,11 +53,7 @@ import {
   appendRequestLog,
   saveCallLog,
 } from "@/lib/usageDb";
-import {
-  getLoggedInputTokens,
-  getLoggedOutputTokens,
-  formatUsageLog,
-} from "@/lib/usage/tokenAccounting";
+import { formatUsageLog } from "@/lib/usage/tokenAccounting";
 import { recordCost } from "@/domain/costRules";
 import { calculateCost } from "@/lib/usage/costCalculator";
 import { buildOmniRouteResponseMetaHeaders } from "@/domain/omnirouteResponseMeta";
@@ -79,10 +77,15 @@ import {
   shouldPreserveCacheControl,
   providerSupportsCaching,
 } from "../utils/cacheControlPolicy.ts";
-import { getCacheMetrics } from "@/lib/db/settings.ts";
 import { getCachedSettings } from "@/lib/db/readCache";
 import { cacheReasoningFromAssistantMessage } from "../services/reasoningCache.ts";
 import { sanitizeOpenAITool } from "../services/toolSchemaSanitizer.ts";
+import {
+  getEffectiveToolLimit,
+  setDetectedToolLimit,
+  parseToolLimitFromError,
+  shouldDetectLimit,
+} from "../services/toolLimitDetector.ts";
 
 import {
   parseCodexQuotaHeaders,
@@ -564,10 +567,13 @@ function normalizeNonStreamingEventPayload(rawBody: string, contentType: string)
 }
 
 function getHeaderValueCaseInsensitive(
-  headers: Record<string, unknown> | null | undefined,
+  headers: Record<string, unknown> | Headers | null | undefined,
   targetName: string
 ) {
   if (!headers || typeof headers !== "object") return null;
+  if (headers instanceof Headers) {
+    return headers.get(targetName);
+  }
   const lowered = targetName.toLowerCase();
   for (const [key, value] of Object.entries(headers)) {
     if (key.toLowerCase() === lowered && typeof value === "string" && value.trim()) {
@@ -686,7 +692,8 @@ function resolveAccountSemaphoreKey({
 function buildClaudePromptCacheLogMeta(
   targetFormat: string,
   finalBody: Record<string, unknown> | null | undefined,
-  providerHeaders: Record<string, unknown> | null | undefined
+  providerHeaders: Record<string, unknown> | Headers | null | undefined,
+  clientHeaders?: Headers | Record<string, unknown> | null | undefined
 ) {
   if (targetFormat !== FORMATS.CLAUDE || !finalBody || typeof finalBody !== "object") return null;
 
@@ -755,7 +762,10 @@ function buildClaudePromptCacheLogMeta(
 
   const totalBreakpoints =
     systemBreakpoints.length + toolBreakpoints.length + messageBreakpoints.length;
-  const anthropicBeta = getHeaderValueCaseInsensitive(providerHeaders, "Anthropic-Beta");
+  let anthropicBeta = getHeaderValueCaseInsensitive(providerHeaders, "Anthropic-Beta");
+  if (!anthropicBeta) {
+    anthropicBeta = getHeaderValueCaseInsensitive(clientHeaders, "Anthropic-Beta");
+  }
 
   if (totalBreakpoints === 0 && !anthropicBeta) return null;
 
@@ -1177,7 +1187,7 @@ export async function handleChatCore({
   // the correct, aliased model ID. Without this, aliases only affect format detection.
   const resolvedModel = resolveModelAlias(model);
   // Use resolvedModel for all downstream operations (routing, provider requests, logging)
-  const effectiveModel = resolvedModel !== model ? resolvedModel : model;
+  const effectiveModel = resolvedModel === model ? model : resolvedModel;
   if (resolvedModel !== model) {
     log?.info?.("ALIAS", `Model alias applied: ${model} → ${resolvedModel}`);
   }
@@ -1377,7 +1387,7 @@ export async function handleChatCore({
   const acceptHeader =
     clientRawRequest?.headers && typeof clientRawRequest.headers.get === "function"
       ? clientRawRequest.headers.get("accept") || clientRawRequest.headers.get("Accept")
-      : (clientRawRequest?.headers || {})["accept"] || (clientRawRequest?.headers || {})["Accept"];
+      : clientRawRequest?.headers?.["accept"] || clientRawRequest?.headers?.["Accept"];
 
   const explicitStreamAlias = resolveExplicitStreamAlias(body);
 
@@ -1605,8 +1615,10 @@ export async function handleChatCore({
   // ── Proactive Context Compression (Phase 4) ──
   // Check if context exceeds 70% of limit and compress proactively before sending to provider.
   // This prevents "prompt too long" errors for large-but-not-full contexts.
-  const allMessages =
-    body?.messages || body?.input || body?.contents || body?.request?.contents || [];
+  const compressionBody = body
+    ? adaptBodyForCompression(body as Record<string, unknown>).body
+    : null;
+  const allMessages = compressionBody?.messages || body?.contents || body?.request?.contents || [];
   let cavemanOutputModeApplied = false;
   let cavemanOutputModeIntensity: string | null = null;
   if (body && Array.isArray(allMessages) && allMessages.length > 0) {
@@ -1889,6 +1901,7 @@ export async function handleChatCore({
                   0,
                   result.stats.originalTokens - result.stats.compressedTokens
                 );
+                const rtkPointers = result.stats.rtkRawOutputPointers ?? [];
                 const estimatedUsdSaved = await calculateCost(
                   provider ?? "",
                   effectiveModel ?? "",
@@ -1912,8 +1925,14 @@ export async function handleChatCore({
                   estimated_usd_saved: estimatedUsdSaved || null,
                   validation_fallback: result.stats.fallbackApplied ? 1 : 0,
                   output_mode: cavemanOutputModeApplied ? cavemanOutputModeIntensity : null,
-                  rtk_raw_output_pointer: result.stats.rtkRawOutputPointers?.[0]?.id ?? null,
-                  rtk_raw_output_bytes: result.stats.rtkRawOutputPointers?.[0]?.bytes ?? null,
+                  rtk_raw_output_pointer: rtkPointers[0]?.id ?? null,
+                  rtk_raw_output_bytes: rtkPointers[0]?.bytes ?? null,
+                  rtk_raw_output_pointers: rtkPointers.length
+                    ? JSON.stringify(rtkPointers.map((pointer) => pointer.id))
+                    : null,
+                  rtk_raw_output_total_bytes: rtkPointers.length
+                    ? rtkPointers.reduce((total, pointer) => total + pointer.bytes, 0)
+                    : null,
                 });
               } catch (err) {
                 log?.debug?.(
@@ -2371,11 +2390,11 @@ export async function handleChatCore({
               type: "function",
               function: {
                 name: t.name,
-                ...(t.description !== undefined ? { description: t.description } : {}),
+                ...(t.description === undefined ? {} : { description: t.description }),
                 ...(t.parameters !== undefined || t.input_schema !== undefined
                   ? { parameters: t.parameters ?? t.input_schema ?? {} }
                   : {}),
-                ...(t.strict !== undefined ? { strict: t.strict } : {}),
+                ...(t.strict === undefined ? {} : { strict: t.strict }),
               },
             };
           });
@@ -2681,6 +2700,20 @@ export async function handleChatCore({
         );
       }
 
+      const effectiveToolLimit = getEffectiveToolLimit(provider);
+      if (
+        effectiveToolLimit < MAX_TOOLS_LIMIT &&
+        Array.isArray(bodyToSend.tools) &&
+        bodyToSend.tools.length > effectiveToolLimit
+      ) {
+        const truncatedTools = bodyToSend.tools.slice(0, effectiveToolLimit);
+        bodyToSend = { ...bodyToSend, tools: truncatedTools };
+        log?.debug?.(
+          "TOOL_LIMIT",
+          `Truncated ${bodyToSend.tools.length} tools to ${effectiveToolLimit} for ${provider}`
+        );
+      }
+
       // Qwen OAuth rejects requests without a non-empty `user` field.
       // Some minimal OpenAI-compatible clients omit it, so we backfill a
       // stable default only for OAuth mode (API key mode is unaffected).
@@ -2788,7 +2821,9 @@ export async function handleChatCore({
               ) {
                 const failedConnectionId = credentials?.connectionId || connectionId;
                 const retryAfterHeader = res.response.headers.get("retry-after");
-                const retryAfterMs = retryAfterHeader ? parseFloat(retryAfterHeader) * 1000 : null;
+                const retryAfterMs = retryAfterHeader
+                  ? Number.parseFloat(retryAfterHeader) * 1000
+                  : null;
 
                 log?.warn?.(
                   "CODEX_FAILOVER",
@@ -2873,6 +2908,7 @@ export async function handleChatCore({
                       headers: res.response.headers,
                     }
                   ),
+                  headers: res.response.headers,
                 };
               }
 
@@ -2889,17 +2925,18 @@ export async function handleChatCore({
         // Non-stream: release semaphore immediately after reading full response body.
         const status = rawResult.response.status;
         const statusText = rawResult.response.statusText;
-        const headers = Array.from(rawResult.response.headers.entries()) as [string, string][];
+        const headers = new Headers(rawResult.response.headers);
         const payload = await withBodyTimeout<string>(rawResult.response.text());
         acquireAccountSemaphoreRelease();
 
         return {
           ...rawResult,
           response: new Response(payload, { status, statusText, headers }),
+          headers,
           _dedupSnapshot: {
             status,
             statusText,
-            headers,
+            headers: Array.from(headers.entries()),
             payload,
           },
         };
@@ -2959,7 +2996,8 @@ export async function handleChatCore({
     claudePromptCacheLogMeta = buildClaudePromptCacheLogMeta(
       targetFormat,
       finalBody,
-      providerHeaders
+      providerHeaders,
+      clientRawRequest?.headers
     );
 
     // Log target request (final request to provider)
@@ -3052,11 +3090,22 @@ export async function handleChatCore({
     upstreamErrorParsed = true;
   }
 
+  const errorMessageForToolDetection =
+    typeof upstreamErrorBody === "string"
+      ? upstreamErrorBody
+      : JSON.stringify(upstreamErrorBody ?? {});
+  if (shouldDetectLimit(errorMessageForToolDetection, parsedStatusCode)) {
+    const detectedLimit = parseToolLimitFromError(errorMessageForToolDetection);
+    if (detectedLimit) {
+      setDetectedToolLimit(provider, detectedLimit);
+      log?.info?.("TOOL_LIMIT", `Detected tool limit ${detectedLimit} for ${provider}`);
+    }
+  }
+
   const isQwenExpiredError =
     provider === "qwen" &&
     parsedStatusCode === HTTP_STATUS.BAD_REQUEST &&
-    parsedMessage &&
-    parsedMessage.toLowerCase().includes("session has expired");
+    parsedMessage?.toLowerCase().includes("session has expired");
 
   const streamOptionsOnlyFailed = false; // TODO: properly track stream options failure? (placeholder from existing logic)
 
@@ -3108,7 +3157,7 @@ export async function handleChatCore({
         if (retryResult.response.ok) {
           providerResponse = retryResult.response;
           providerUrl = retryResult.url;
-          providerHeaders = retryResult.headers;
+          providerHeaders = new Headers(retryResult.headers || {});
           finalBody = retryResult.transformedBody;
           reqLogger.logTargetRequest(providerUrl, providerHeaders, finalBody);
           updatePendingRequest(model, provider, connectionId, {
@@ -3461,7 +3510,7 @@ export async function handleChatCore({
               translatedBody.model = fbDecision.model;
               providerResponse = fbResult.response;
               providerUrl = fbResult.url;
-              providerHeaders = fbResult.headers;
+              providerHeaders = new Headers(fbResult.headers || {});
               finalBody = fbResult.transformedBody;
               reqLogger.logTargetRequest(providerUrl, providerHeaders, finalBody);
               log?.info?.(
@@ -3664,25 +3713,6 @@ export async function handleChatCore({
       const msg = `[${new Date().toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit" })}] 📊 [USAGE] ${provider.toUpperCase()} | ${formatUsageLog(usage)}${connectionId ? ` | account=${connectionId.slice(0, 8)}...` : ""}`;
       console.log(`${COLORS.green}${msg}${COLORS.reset}`);
 
-      const inputTokens = usage.prompt_tokens || 0;
-      const cachedTokens = toPositiveNumber(
-        usage.cache_read_input_tokens ??
-          usage.cached_tokens ??
-          (
-            (usage as Record<string, unknown>).prompt_tokens_details as
-              | Record<string, unknown>
-              | undefined
-          )?.cached_tokens
-      );
-      const cacheCreationTokens = toPositiveNumber(
-        usage.cache_creation_input_tokens ??
-          (
-            (usage as Record<string, unknown>).prompt_tokens_details as
-              | Record<string, unknown>
-              | undefined
-          )?.cache_creation_tokens
-      );
-
       saveRequestUsage({
         provider: provider || "unknown",
         model: model || "unknown",
@@ -3708,7 +3738,7 @@ export async function handleChatCore({
           responseBody,
           responsePayloadFormat,
           clientResponseFormat,
-          responseToolNameMap as Map<string, string> | null
+          responseToolNameMap
         )
       : responseBody;
     const memoryExtractionResponse = translatedResponse;
@@ -3904,6 +3934,7 @@ export async function handleChatCore({
       success: true,
       response: new Response(JSON.stringify(translatedResponse), {
         headers: {
+          ...Object.fromEntries(providerHeaders.entries()),
           "Content-Type": "application/json",
           [OMNIROUTE_RESPONSE_HEADERS.cache]: "MISS",
           ...buildOmniRouteResponseMetaHeaders({
@@ -3928,12 +3959,6 @@ export async function handleChatCore({
   });
   if (streamReadiness.ok === false) {
     const { response: failureResponse, reason } = streamReadiness;
-    const failure = {
-      status: failureResponse.status,
-      message: reason,
-      code: "stream_readiness_timeout",
-      type: "stream_timeout",
-    };
     trackPendingRequest(model, provider, connectionId, false);
     appendRequestLog({
       model,
@@ -3968,7 +3993,12 @@ export async function handleChatCore({
     await onRequestSuccess();
   }
 
-  const responseHeaders = {
+  const responseHeaders: Record<string, string> = {
+    ...Object.fromEntries(
+      Array.from(providerResponse.headers.entries()).filter(
+        ([k]) => k.toLowerCase() !== "content-type"
+      )
+    ),
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
     Connection: "keep-alive",
@@ -4026,24 +4056,6 @@ export async function handleChatCore({
     // Track cache token metrics for streaming responses
     if (streamUsage && typeof streamUsage === "object") {
       attachCompressionUsageReceiptAfterAnalytics(streamUsage as Record<string, unknown>, "stream");
-      const inputTokens = streamUsage.prompt_tokens || 0;
-      const cachedTokens = toPositiveNumber(
-        streamUsage.cache_read_input_tokens ??
-          streamUsage.cached_tokens ??
-          (
-            (streamUsage as Record<string, unknown>).prompt_tokens_details as
-              | Record<string, unknown>
-              | undefined
-          )?.cached_tokens
-      );
-      const cacheCreationTokens = toPositiveNumber(
-        streamUsage.cache_creation_input_tokens ??
-          (
-            (streamUsage as Record<string, unknown>).prompt_tokens_details as
-              | Record<string, unknown>
-              | undefined
-          )?.cache_creation_tokens
-      );
 
       saveRequestUsage({
         provider: provider || "unknown",
